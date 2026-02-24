@@ -39,7 +39,7 @@ class CameraService {
 
       _controller = CameraController(
         backCamera,
-        ResolutionPreset.low, // Low res = faster processing
+        ResolutionPreset.medium, // Medium res for better signal quality
         enableAudio: false,
         imageFormatGroup: ImageFormatGroup.yuv420,
       );

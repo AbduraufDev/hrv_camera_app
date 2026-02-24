@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'package:flutter/material.dart';
+import 'package:camera/camera.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
 import '../services/camera_service.dart';
@@ -39,7 +40,7 @@ class _HrvScreenState extends State<HrvScreen> with TickerProviderStateMixin {
   // Timer
   int _elapsedSeconds = 0;
   Timer? _timer;
-  static const int _measurementDuration = 120; // 2 minutes
+  static const int _measurementDuration = 90; // 1.5 minutes
 
   // Animation
   late AnimationController _pulseController;
@@ -63,14 +64,31 @@ class _HrvScreenState extends State<HrvScreen> with TickerProviderStateMixin {
   }
 
   Future<void> _initCamera() async {
-    // Request camera permission
-    final status = await Permission.camera.request();
-    if (status.isGranted) {
+    // Check current permission status
+    var status = await Permission.camera.status;
+
+    // If not determined yet, request permission
+    if (status.isDenied || status.isRestricted) {
+      status = await Permission.camera.request();
+    }
+
+    if (status.isGranted || status.isLimited) {
       setState(() => _permissionGranted = true);
       final ready = await _cameraService.initialize();
       setState(() => _cameraReady = ready);
-    } else {
+    } else if (status.isPermanentlyDenied) {
+      // Only show settings if permanently denied
       setState(() => _permissionGranted = false);
+    } else {
+      // Try requesting again
+      status = await Permission.camera.request();
+      if (status.isGranted || status.isLimited) {
+        setState(() => _permissionGranted = true);
+        final ready = await _cameraService.initialize();
+        setState(() => _cameraReady = ready);
+      } else {
+        setState(() => _permissionGranted = false);
+      }
     }
   }
 
@@ -259,8 +277,8 @@ class _HrvScreenState extends State<HrvScreen> with TickerProviderStateMixin {
           _buildHeader(),
           const SizedBox(height: 16),
 
-          // PPG Chart
-          _buildChartSection(),
+          // Camera Preview and PPG Chart side by side
+          _buildCameraAndChart(),
           const SizedBox(height: 16),
 
           // Signal quality & timer
@@ -333,6 +351,101 @@ class _HrvScreenState extends State<HrvScreen> with TickerProviderStateMixin {
               ],
             ),
           ),
+      ],
+    );
+  }
+
+  Widget _buildCameraAndChart() {
+    return Column(
+      children: [
+        // Camera preview and PPG chart in a row
+        Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            // Camera Preview
+            Expanded(
+              flex: 2,
+              child: _buildCameraPreview(),
+            ),
+            const SizedBox(width: 12),
+            // PPG Chart
+            Expanded(
+              flex: 3,
+              child: _buildChartSection(),
+            ),
+          ],
+        ),
+      ],
+    );
+  }
+
+  Widget _buildCameraPreview() {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(
+          'Camera',
+          style: TextStyle(
+            color: Colors.white.withValues(alpha: 0.7),
+            fontSize: 13,
+            fontWeight: FontWeight.w500,
+          ),
+        ),
+        const SizedBox(height: 8),
+        Container(
+          height: 180,
+          decoration: BoxDecoration(
+            color: const Color(0xFF16213e),
+            borderRadius: BorderRadius.circular(16),
+            border: Border.all(
+              color: _isMeasuring
+                  ? (_signalQuality > 0.5
+                      ? const Color(0xFF4ecdc4)
+                      : _signalQuality > 0.25
+                          ? const Color(0xFFf9ca24)
+                          : const Color(0xFFff6b6b))
+                  : Colors.white.withValues(alpha: 0.1),
+              width: 2,
+            ),
+          ),
+          child: ClipRRect(
+            borderRadius: BorderRadius.circular(14),
+            child: _cameraService.isInitialized && _cameraService.controller != null
+                ? CameraPreview(_cameraService.controller!)
+                : const Center(
+                    child: Icon(
+                      Icons.camera_alt_outlined,
+                      color: Colors.white24,
+                      size: 48,
+                    ),
+                  ),
+          ),
+        ),
+        const SizedBox(height: 8),
+        // Finger placement indicator
+        Container(
+          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+          decoration: BoxDecoration(
+            color: _isMeasuring
+                ? (_signalQuality > 0.5
+                    ? const Color(0xFF4ecdc4).withValues(alpha: 0.2)
+                    : const Color(0xFFff6b6b).withValues(alpha: 0.2))
+                : Colors.transparent,
+            borderRadius: BorderRadius.circular(8),
+          ),
+          child: Text(
+            _isMeasuring
+                ? (_signalQuality > 0.5
+                    ? 'Finger detected'
+                    : 'Place finger on camera')
+                : 'Ready to measure',
+            style: TextStyle(
+              color: Colors.white.withValues(alpha: 0.6),
+              fontSize: 11,
+            ),
+            textAlign: TextAlign.center,
+          ),
+        ),
       ],
     );
   }
@@ -605,7 +718,7 @@ class _HrvScreenState extends State<HrvScreen> with TickerProviderStateMixin {
           const SizedBox(height: 6),
           _buildInstruction('3', 'Wait for the signal to stabilize (green indicator)'),
           const SizedBox(height: 6),
-          _buildInstruction('4', 'Measurement takes 2 minutes for accurate HRV'),
+          _buildInstruction('4', 'Measurement takes 1.5 minutes for accurate HRV'),
         ],
       ),
     );

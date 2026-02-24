@@ -39,7 +39,7 @@ class HrvCalculator {
   // Physiological limits for RR intervals
   static const double _minRR = 300; // ms (~200 bpm)
   static const double _maxRR = 1500; // ms (~40 bpm)
-  static const double _maxRRChange = 0.20; // 20% beat-to-beat change allowed
+  static const double _maxRRChange = 0.50; // 50% beat-to-beat change allowed (normal HRV can vary significantly)
 
   HrvCalculator({double sampleRate = 30.0}) : _sampleRate = sampleRate;
 
@@ -49,26 +49,34 @@ class HrvCalculator {
     if (peakIndices.length < 2) return HrvMetrics.empty;
 
     // Compute RR intervals from peak indices
+    double? previousRR;
     for (int i = 1; i < peakIndices.length; i++) {
       final rrSamples = peakIndices[i] - peakIndices[i - 1];
       final rrMs = (rrSamples / _sampleRate) * 1000.0;
 
       // Validate physiological plausibility
       if (rrMs >= _minRR && rrMs <= _maxRR) {
-        if (_rrIntervals.isNotEmpty) {
-          final change =
-              (rrMs - _rrIntervals.last).abs() / _rrIntervals.last;
+        // Check against previous RR in this batch, not last stored
+        if (previousRR != null) {
+          final change = (rrMs - previousRR).abs() / previousRR;
           if (change <= _maxRRChange) {
             _rrIntervals.add(rrMs);
           }
-        } else {
+        } else if (_rrIntervals.isEmpty) {
           _rrIntervals.add(rrMs);
+        } else {
+          // Compare with last stored interval
+          final change = (rrMs - _rrIntervals.last).abs() / _rrIntervals.last;
+          if (change <= _maxRRChange) {
+            _rrIntervals.add(rrMs);
+          }
         }
+        previousRR = rrMs;
       }
     }
 
-    // Keep a sliding window of intervals (last ~120 seconds worth)
-    while (_rrIntervals.length > 150) {
+    // Keep a sliding window of intervals (last ~180 seconds worth for 2 min measurement)
+    while (_rrIntervals.length > 200) {
       _rrIntervals.removeAt(0);
     }
 
