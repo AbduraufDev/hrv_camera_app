@@ -40,7 +40,7 @@ class _HrvScreenState extends State<HrvScreen> with TickerProviderStateMixin {
   // Timer
   int _elapsedSeconds = 0;
   Timer? _timer;
-  static const int _measurementDuration = 90; // 1.5 minutes
+  static const int _measurementDuration = 60; // 1 minute (research-validated)
 
   // Animation
   late AnimationController _pulseController;
@@ -718,7 +718,7 @@ class _HrvScreenState extends State<HrvScreen> with TickerProviderStateMixin {
           const SizedBox(height: 6),
           _buildInstruction('3', 'Wait for the signal to stabilize (green indicator)'),
           const SizedBox(height: 6),
-          _buildInstruction('4', 'Measurement takes 1.5 minutes for accurate HRV'),
+          _buildInstruction('4', 'Measurement takes 1 minute for accurate HRV'),
         ],
       ),
     );

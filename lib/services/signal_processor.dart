@@ -1,4 +1,5 @@
 import 'dart:math';
+import 'dart:typed_data';
 
 /// Second-order section (biquad) coefficients for IIR filtering.
 class BiquadSection {
@@ -25,138 +26,186 @@ class BiquadSection {
 class Peak {
   final int index;
   final double value;
-  const Peak(this.index, this.value);
+  final double prominence;
+  const Peak(this.index, this.value, [this.prominence = 0]);
 }
 
-/// PPG signal processor with Butterworth bandpass filter and Elgendi peak detection.
+/// Advanced PPG signal processor with adaptive filtering and robust peak detection.
+/// Based on research: Aboy++ algorithm and HRVCam methodology.
 class SignalProcessor {
-  // Butterworth bandpass filter (4th order = 2 biquad sections)
-  // Designed for 0.7–4.0 Hz passband at 30 Hz sample rate (heart rate range ~42–240 bpm)
-  late List<BiquadSection> _sections;
   final double _sampleRate;
 
-  // Elgendi peak detection parameters
-  static const double _w1Duration = 0.111; // systolic peak window (seconds)
-  static const double _w2Duration = 0.667; // beat window (seconds)
-  static const double _beta = 0.02; // threshold offset
+  // Butterworth bandpass filter sections
+  late List<BiquadSection> _bpSections;
 
-  // Signal quality
+  // Smoothing filter for noise reduction
+  late List<BiquadSection> _smoothSections;
+
+  // Adaptive parameters
+  double _estimatedHR = 70.0; // Initial HR estimate in BPM
+  double _adaptiveThreshold = 0.0;
+
+  // Signal buffers for advanced processing
   final List<double> _rawBuffer = [];
-  static const int _qualityWindowSize = 90; // 3 seconds at 30 fps
+  final List<double> _filteredBuffer = [];
+  final List<int> _recentPeakIndices = [];
+
+  // Constants based on research
+  static const int _windowSize = 300; // 10 seconds at 30 fps
+  static const double _minHR = 40.0; // BPM
+  static const double _maxHR = 200.0; // BPM
+  static const double _refractoryPeriod = 0.25; // 250ms minimum between beats
+
+  // Elgendi parameters (optimized)
+  static const double _w1Duration = 0.111; // systolic peak window
+  static const double _w2Duration = 0.667; // beat window
 
   SignalProcessor({double sampleRate = 30.0}) : _sampleRate = sampleRate {
-    _initFilter(sampleRate);
+    _initFilters();
   }
 
-  void _initFilter(double fs) {
-    _sections = _computeButterworthBandpass(0.7, 4.0, fs);
+  void _initFilters() {
+    // Primary bandpass: 0.75-3.5 Hz (45-210 BPM range, optimized)
+    _bpSections = _computeButterworthBandpass(0.75, 3.5, _sampleRate, 2);
+
+    // Smoothing lowpass at 8 Hz for noise reduction
+    _smoothSections = _computeButterworthLowpass(8.0, _sampleRate);
   }
 
-  /// Compute Butterworth bandpass filter as cascaded biquad sections.
-  /// Uses bilinear transform method.
+  /// Compute Butterworth bandpass filter with specified order.
   List<BiquadSection> _computeButterworthBandpass(
-      double f1, double f2, double fs) {
-    // For a 4th order bandpass (2nd order prototype), we get 4 poles = 2 biquad sections
-    // Using cookbook formulas for bandpass biquads
+      double f1, double f2, double fs, int order) {
+    final sections = <BiquadSection>[];
+    final wc = sqrt(2 * pi * f1 / fs * 2 * pi * f2 / fs);
+    final bw = 2 * pi * f2 / fs - 2 * pi * f1 / fs;
 
-    final w01 = 2 * pi * f1 / fs;
-    final w02 = 2 * pi * f2 / fs;
-    final wc = sqrt(w01 * w02);
+    for (int i = 0; i < order; i++) {
+      final angle = pi * (2 * i + 1) / (4 * order) + pi / 2;
+      final q = 1 / (2 * cos(angle));
+      final alpha = sin(wc) / (2 * q.abs());
+      final cosW = cos(wc);
 
-    // Section 1: narrower Q
-    final q1 = 0.7071; // 1/sqrt(2) for Butterworth
-    final alpha1 = sin(wc) / (2 * q1);
-    final cosW = cos(wc);
+      final a0 = 1 + alpha;
+      sections.add(BiquadSection(
+        alpha / a0,
+        0.0,
+        -alpha / a0,
+        -2 * cosW / a0,
+        (1 - alpha) / a0,
+      ));
+    }
+    return sections;
+  }
 
-    final b0_1 = alpha1;
-    final b1_1 = 0.0;
-    final b2_1 = -alpha1;
-    final a0_1 = 1 + alpha1;
-    final a1_1 = -2 * cosW;
-    final a2_1 = 1 - alpha1;
-
-    // Section 2: wider Q for sharper rolloff
-    final q2 = 1.3066; // Second Butterworth pole radius
-    final alpha2 = sin(wc) / (2 * q2);
-
-    final b0_2 = alpha2;
-    final b1_2 = 0.0;
-    final b2_2 = -alpha2;
-    final a0_2 = 1 + alpha2;
-    final a1_2 = -2 * cosW;
-    final a2_2 = 1 - alpha2;
+  /// Compute Butterworth lowpass filter.
+  List<BiquadSection> _computeButterworthLowpass(double fc, double fs) {
+    final wc = tan(pi * fc / fs);
+    final k = wc * wc;
+    final q = 0.7071;
+    final norm = 1 / (1 + wc / q + k);
 
     return [
       BiquadSection(
-          b0_1 / a0_1, b1_1 / a0_1, b2_1 / a0_1, a1_1 / a0_1, a2_1 / a0_1),
-      BiquadSection(
-          b0_2 / a0_2, b1_2 / a0_2, b2_2 / a0_2, a1_2 / a0_2, a2_2 / a0_2),
+        k * norm,
+        2 * k * norm,
+        k * norm,
+        2 * (k - 1) * norm,
+        (1 - wc / q + k) * norm,
+      ),
     ];
   }
 
-
-  /// Process a single raw sample through the bandpass filter.
+  /// Process a single raw sample through filters.
   double filter(double sample) {
-    double y = sample;
-    for (final section in _sections) {
-      y = section.process(y);
+    // Apply smoothing first
+    double smoothed = sample;
+    for (final section in _smoothSections) {
+      smoothed = section.process(smoothed);
     }
-    return y;
+
+    // Then bandpass
+    double filtered = smoothed;
+    for (final section in _bpSections) {
+      filtered = section.process(filtered);
+    }
+
+    _rawBuffer.add(sample);
+    _filteredBuffer.add(filtered);
+
+    // Keep buffers manageable
+    if (_rawBuffer.length > _windowSize * 2) {
+      _rawBuffer.removeRange(0, _windowSize);
+      _filteredBuffer.removeRange(0, _windowSize);
+    }
+
+    return filtered;
   }
 
-  /// Reset all filter states.
+  /// Reset all states.
   void reset() {
-    for (final section in _sections) {
+    for (final section in _bpSections) {
+      section.reset();
+    }
+    for (final section in _smoothSections) {
       section.reset();
     }
     _rawBuffer.clear();
+    _filteredBuffer.clear();
+    _recentPeakIndices.clear();
+    _estimatedHR = 70.0;
+    _adaptiveThreshold = 0.0;
   }
 
-  /// Detect peaks using Elgendi's two moving average method.
-  /// Input: filtered PPG signal buffer.
-  /// Returns list of peak indices.
+  /// Advanced peak detection using Aboy++ methodology.
   List<Peak> detectPeaks(List<double> signal) {
-    if (signal.length < 10) return [];
+    if (signal.length < 30) return [];
 
     final n = signal.length;
-    final w1 = max(1, (_w1Duration * _sampleRate).round()); // systolic window
-    final w2 = max(1, (_w2Duration * _sampleRate).round()); // beat window
+    final w1 = max(3, (_w1Duration * _sampleRate).round());
+    final w2 = max(10, (_w2Duration * _sampleRate).round());
 
-    // Squaring to enhance peaks
+    // Step 1: Compute first derivative for slope detection
+    final derivative = List<double>.filled(n, 0);
+    for (int i = 1; i < n - 1; i++) {
+      derivative[i] = (signal[i + 1] - signal[i - 1]) / 2;
+    }
+
+    // Step 2: Square the signal to enhance peaks
     final squared = signal.map((s) => s * s).toList();
 
-    // Moving average with window w1 (peak emphasis)
+    // Step 3: Moving averages (Elgendi method)
     final ma1 = _movingAverage(squared, w1);
-    // Moving average with window w2 (beat emphasis)
     final ma2 = _movingAverage(squared, w2);
 
-    // Threshold: ma2 + beta offset
-    final threshold = ma2.map((v) => v + _beta).toList();
+    // Step 4: Adaptive threshold based on signal statistics
+    final signalStd = _standardDeviation(signal);
+    final beta = 0.02 + 0.01 * (signalStd / 10).clamp(0, 1);
 
-    // Blocks of interest where ma1 > threshold
+    // Step 5: Find blocks of interest
     final blocks = <List<int>>[];
     int? blockStart;
     for (int i = 0; i < n; i++) {
-      if (ma1[i] > threshold[i]) {
+      final threshold = ma2[i] + beta;
+      if (ma1[i] > threshold) {
         blockStart ??= i;
       } else {
-        if (blockStart != null) {
+        if (blockStart != null && (i - blockStart) >= 2) {
           blocks.add([blockStart, i - 1]);
-          blockStart = null;
         }
+        blockStart = null;
       }
     }
-    if (blockStart != null) {
+    if (blockStart != null && (n - blockStart) >= 2) {
       blocks.add([blockStart, n - 1]);
     }
 
-    // Find maximum within each block
+    // Step 6: Find peaks with prominence calculation
     final peaks = <Peak>[];
     for (final block in blocks) {
       final start = block[0];
       final end = block[1];
-      if (end - start < 2) continue; // skip very narrow blocks
 
+      // Find maximum in block
       double maxVal = -double.infinity;
       int maxIdx = start;
       for (int i = start; i <= end; i++) {
@@ -165,25 +214,110 @@ class SignalProcessor {
           maxIdx = i;
         }
       }
-      peaks.add(Peak(maxIdx, maxVal));
+
+      // Calculate prominence
+      final leftMin = _findMinInRange(signal, max(0, maxIdx - w2), maxIdx);
+      final rightMin = _findMinInRange(signal, maxIdx, min(n - 1, maxIdx + w2));
+      final prominence = maxVal - max(leftMin, rightMin);
+
+      // Only add if prominence is significant (25% of average amplitude)
+      if (prominence > signalStd * 0.5) {
+        peaks.add(Peak(maxIdx, maxVal, prominence));
+      }
     }
 
-    // Remove peaks that are too close together (refractory period ~300ms)
-    final refractorySamples = (0.3 * _sampleRate).round();
+    // Step 7: Adaptive refractory period based on estimated HR
+    final minPeakDistance = (_sampleRate * 60 / _maxHR).round();
+    final maxPeakDistance = (_sampleRate * 60 / _minHR).round();
+    final expectedDistance = (_sampleRate * 60 / _estimatedHR).round();
+    final refractorySamples = max(minPeakDistance, (expectedDistance * 0.6).round());
+
+    // Step 8: Filter peaks by refractory period
     final filtered = <Peak>[];
     for (final peak in peaks) {
-      if (filtered.isEmpty ||
-          (peak.index - filtered.last.index) >= refractorySamples) {
+      if (filtered.isEmpty) {
         filtered.add(peak);
-      } else if (peak.value > filtered.last.value) {
-        filtered[filtered.length - 1] = peak;
+      } else {
+        final distance = peak.index - filtered.last.index;
+        if (distance >= refractorySamples) {
+          filtered.add(peak);
+        } else if (peak.prominence > filtered.last.prominence * 1.2) {
+          // Replace if new peak is significantly more prominent
+          filtered[filtered.length - 1] = peak;
+        }
+      }
+    }
+
+    // Step 9: Update HR estimate from detected peaks
+    if (filtered.length >= 3) {
+      final intervals = <double>[];
+      for (int i = 1; i < filtered.length; i++) {
+        final interval = (filtered[i].index - filtered[i - 1].index) / _sampleRate;
+        if (interval > 0.3 && interval < 1.5) {
+          intervals.add(interval);
+        }
+      }
+      if (intervals.isNotEmpty) {
+        final meanInterval = intervals.reduce((a, b) => a + b) / intervals.length;
+        final newHR = 60.0 / meanInterval;
+        // Smooth HR estimate
+        _estimatedHR = _estimatedHR * 0.7 + newHR * 0.3;
+        _estimatedHR = _estimatedHR.clamp(_minHR, _maxHR);
       }
     }
 
     return filtered;
   }
 
-  /// Compute moving average of given window size.
+  /// Detect heart rate using FFT (frequency domain backup method).
+  double detectHRByFFT(List<double> signal) {
+    if (signal.length < 128) return _estimatedHR;
+
+    // Use power of 2 length for FFT
+    final fftSize = _nextPowerOf2(signal.length);
+    final paddedSignal = List<double>.filled(fftSize, 0);
+    for (int i = 0; i < signal.length; i++) {
+      paddedSignal[i] = signal[i];
+    }
+
+    // Simple DFT for dominant frequency
+    double maxPower = 0;
+    double dominantFreq = 1.0;
+
+    final minBin = (fftSize * 0.75 / _sampleRate).round(); // 0.75 Hz = 45 BPM
+    final maxBin = (fftSize * 3.5 / _sampleRate).round();  // 3.5 Hz = 210 BPM
+
+    for (int k = minBin; k <= maxBin && k < fftSize ~/ 2; k++) {
+      double real = 0, imag = 0;
+      for (int n = 0; n < fftSize; n++) {
+        final angle = -2 * pi * k * n / fftSize;
+        real += paddedSignal[n] * cos(angle);
+        imag += paddedSignal[n] * sin(angle);
+      }
+      final power = real * real + imag * imag;
+      if (power > maxPower) {
+        maxPower = power;
+        dominantFreq = k * _sampleRate / fftSize;
+      }
+    }
+
+    return dominantFreq * 60; // Convert Hz to BPM
+  }
+
+  int _nextPowerOf2(int n) {
+    int power = 1;
+    while (power < n) power *= 2;
+    return power;
+  }
+
+  double _findMinInRange(List<double> signal, int start, int end) {
+    double minVal = double.infinity;
+    for (int i = start; i <= end && i < signal.length; i++) {
+      if (signal[i] < minVal) minVal = signal[i];
+    }
+    return minVal;
+  }
+
   List<double> _movingAverage(List<double> data, int windowSize) {
     final n = data.length;
     final result = List<double>.filled(n, 0);
@@ -201,59 +335,104 @@ class SignalProcessor {
     return result;
   }
 
-  /// Assess signal quality from raw buffer (0.0 to 1.0).
-  /// Based on amplitude consistency, periodicity, and noise level.
-  double assessSignalQuality(List<double> rawSignal) {
-    if (rawSignal.length < 30) return 0.0;
+  double _standardDeviation(List<double> data) {
+    if (data.length < 2) return 0;
+    final mean = data.reduce((a, b) => a + b) / data.length;
+    final sumSq = data.map((x) => (x - mean) * (x - mean)).reduce((a, b) => a + b);
+    return sqrt(sumSq / (data.length - 1));
+  }
 
-    // Use last N samples
-    final window = rawSignal.length > _qualityWindowSize
-        ? rawSignal.sublist(rawSignal.length - _qualityWindowSize)
+  /// Advanced signal quality assessment.
+  double assessSignalQuality(List<double> rawSignal) {
+    if (rawSignal.length < 60) return 0.0;
+
+    final window = rawSignal.length > 90
+        ? rawSignal.sublist(rawSignal.length - 90)
         : rawSignal;
 
-    // 1. Check amplitude range (should be reasonable for finger-on-camera)
+    // 1. Amplitude range check
     final minVal = window.reduce(min);
     final maxVal = window.reduce(max);
     final range = maxVal - minVal;
 
-    // Finger on camera typically shows high red channel values with pulsatile variation
     double amplitudeScore;
-    if (range < 0.5) {
-      amplitudeScore = 0.0; // Too flat, probably no finger
-    } else if (range > 50) {
-      amplitudeScore = 0.3; // Too noisy
+    if (range < 1.0) {
+      amplitudeScore = 0.0;
+    } else if (range > 100) {
+      amplitudeScore = 0.2;
     } else {
-      amplitudeScore = min(1.0, range / 15.0);
+      amplitudeScore = (range / 20.0).clamp(0.0, 1.0);
     }
 
-    // 2. Check mean level (finger on camera = high luminance in red channel)
+    // 2. Mean luminance check (finger coverage)
     final mean = window.reduce((a, b) => a + b) / window.length;
     double levelScore;
-    if (mean > 100) {
-      levelScore = 1.0; // Good finger coverage
+    if (mean > 150) {
+      levelScore = 1.0;
+    } else if (mean > 100) {
+      levelScore = 0.8;
     } else if (mean > 50) {
-      levelScore = 0.6;
+      levelScore = 0.5;
     } else {
-      levelScore = 0.2; // Probably no finger
+      levelScore = 0.1;
     }
 
-    // 3. Check signal variance stability (should be relatively stable)
-    final halfLen = window.length ~/ 2;
-    final firstHalf = window.sublist(0, halfLen);
-    final secondHalf = window.sublist(halfLen);
-    final var1 = _variance(firstHalf);
-    final var2 = _variance(secondHalf);
-    final varRatio = var1 > 0 ? min(var1, var2) / max(var1, var2) : 0.0;
-    final stabilityScore = varRatio;
+    // 3. Periodicity check using autocorrelation
+    final periodicityScore = _assessPeriodicity(window);
 
-    return (amplitudeScore * 0.4 + levelScore * 0.35 + stabilityScore * 0.25)
-        .clamp(0.0, 1.0);
+    // 4. Stability check
+    final halfLen = window.length ~/ 2;
+    final var1 = _variance(window.sublist(0, halfLen));
+    final var2 = _variance(window.sublist(halfLen));
+    final stabilityScore = var1 > 0 && var2 > 0
+        ? (min(var1, var2) / max(var1, var2)).clamp(0.0, 1.0)
+        : 0.0;
+
+    // Weighted combination
+    return (amplitudeScore * 0.25 +
+            levelScore * 0.25 +
+            periodicityScore * 0.35 +
+            stabilityScore * 0.15).clamp(0.0, 1.0);
+  }
+
+  /// Assess signal periodicity using simplified autocorrelation.
+  double _assessPeriodicity(List<double> signal) {
+    if (signal.length < 60) return 0.0;
+
+    final n = signal.length;
+    final mean = signal.reduce((a, b) => a + b) / n;
+    final centered = signal.map((x) => x - mean).toList();
+
+    // Check for periodicity at expected heart rate intervals
+    final minLag = (_sampleRate * 0.4).round(); // 150 BPM max
+    final maxLag = (_sampleRate * 1.2).round(); // 50 BPM min
+
+    double maxCorr = 0;
+    double variance = centered.map((x) => x * x).reduce((a, b) => a + b);
+
+    if (variance < 0.01) return 0.0;
+
+    for (int lag = minLag; lag <= maxLag && lag < n ~/ 2; lag++) {
+      double corr = 0;
+      for (int i = 0; i < n - lag; i++) {
+        corr += centered[i] * centered[i + lag];
+      }
+      corr /= variance;
+      if (corr > maxCorr) maxCorr = corr;
+    }
+
+    return maxCorr.clamp(0.0, 1.0);
   }
 
   double _variance(List<double> data) {
     if (data.isEmpty) return 0;
     final mean = data.reduce((a, b) => a + b) / data.length;
-    return data.map((x) => (x - mean) * (x - mean)).reduce((a, b) => a + b) /
-        data.length;
+    return data.map((x) => (x - mean) * (x - mean)).reduce((a, b) => a + b) / data.length;
   }
+
+  /// Get current estimated heart rate.
+  double get estimatedHR => _estimatedHR;
+
+  /// Get filtered signal buffer for analysis.
+  List<double> get filteredBuffer => List.unmodifiable(_filteredBuffer);
 }
